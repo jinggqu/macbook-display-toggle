@@ -75,7 +75,8 @@ release: verify
 	hdiutil create -quiet -volname "MacBook Display Toggle" \
 		-srcfolder "$(DMG_ROOT)" -ov -format UDZO "$(RELEASE_DMG)"
 	hdiutil verify "$(RELEASE_DMG)"
-	shasum -a 256 "$(RELEASE_DMG)" > "$(RELEASE_SHA)"
+	cd build && shasum -a 256 "$(notdir $(RELEASE_DMG))" \
+		> "$(notdir $(RELEASE_SHA))"
 
 clean:
 	rm -rf build

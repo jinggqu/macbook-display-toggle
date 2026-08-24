@@ -41,6 +41,12 @@ make release
 
 The resulting files are `build/MacBook-Display-Toggle-v0.2.0-macOS-arm64.dmg` and its `.sha256` checksum. The DMG is only a transport and installation container for the directory-based `.app`. A future production release should be signed with a Developer ID and notarized to avoid Gatekeeper warnings.
 
+After downloading both Release assets into the same directory, verify the DMG with:
+
+```sh
+shasum -a 256 -c MacBook-Display-Toggle-v0.2.0-macOS-arm64.dmg.sha256
+```
+
 ## Command-line tool
 
 ```sh
@@ -122,6 +128,12 @@ make release
 ```
 
 输出文件为 `build/MacBook-Display-Toggle-v0.2.0-macOS-arm64.dmg` 及对应的 `.sha256` 校验文件。DMG 只是目录型 `.app` 的传输和安装容器；未来正式版应使用 Developer ID 签名并完成 Apple 公证，以免出现 Gatekeeper 警告。
+
+将两个 Release 附件下载到同一目录后，可以验证 DMG：
+
+```sh
+shasum -a 256 -c MacBook-Display-Toggle-v0.2.0-macOS-arm64.dmg.sha256
+```
 
 ## 命令行工具
 
