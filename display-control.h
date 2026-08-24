@@ -26,8 +26,12 @@ typedef struct {
 } DTDDisplayState;
 
 DTDResult dtd_get_display_state(DTDDisplayState *state);
+DTDResult dtd_get_active_external_display_count(uint32_t *count);
+bool dtd_is_hardware_external_display(uint32_t display_id);
 DTDResult dtd_set_builtin_display_enabled(bool enabled,
                                           DTDDisplayState *resulting_state);
+DTDResult dtd_restore_builtin_display(uint32_t builtin_display_id,
+                                      DTDDisplayState *resulting_state);
 DTDResult dtd_toggle_builtin_display(DTDDisplayState *resulting_state);
 const char *dtd_result_message(DTDResult result);
 

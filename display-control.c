@@ -1,7 +1,9 @@
 #include "display-control.h"
 
 #include <CoreGraphics/CoreGraphics.h>
+#include <IOKit/IOKitLib.h>
 #include <dlfcn.h>
+#include <mach/mach.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -113,6 +115,35 @@ static bool list_contains(const DisplayList *list, CGDirectDisplayID id) {
     return false;
 }
 
+/*
+ * macOS can leave virtual or placeholder displays in the active list while a
+ * physical display is being disconnected. Such entries have no IOKit display
+ * service. The vendor fallback keeps compatibility if Apple removes the
+ * deprecated service-port API: physical vendors use 16-bit IDs, whereas
+ * virtual displays commonly use a FourCC pseudo-vendor ID.
+ */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+static bool display_is_hardware_backed(CGDirectDisplayID display_id) {
+    if (CGDisplayIOServicePort(display_id) != MACH_PORT_NULL) {
+        return true;
+    }
+    uint32_t vendor = CGDisplayVendorNumber(display_id);
+    return vendor != 0 && vendor <= UINT16_MAX;
+}
+#pragma clang diagnostic pop
+
+bool dtd_is_hardware_external_display(uint32_t display_id) {
+#if !defined(__arm64__)
+    (void)display_id;
+    return false;
+#else
+    return display_id != kCGNullDirectDisplay &&
+           !CGDisplayIsBuiltin(display_id) &&
+           display_is_hardware_backed(display_id);
+#endif
+}
+
 static DTDResult find_builtin_display(const PrivateAPI *api,
                                       CGDirectDisplayID *builtin_id,
                                       int32_t *cg_error) {
@@ -159,12 +190,53 @@ static DTDResult copy_state(const PrivateAPI *api, DTDDisplayState *state) {
     state->builtin_display_id = builtin_id;
     state->builtin_display_active = list_contains(&active, builtin_id);
     for (uint32_t i = 0; i < active.count; ++i) {
-        if (!CGDisplayIsBuiltin(active.ids[i])) {
+        if (dtd_is_hardware_external_display(active.ids[i])) {
             ++state->active_external_display_count;
         }
     }
 
     free_display_list(&active);
+    return DTD_SUCCESS;
+}
+
+static DTDResult configure_display_enabled(CGDirectDisplayID display_id,
+                                           bool enabled,
+                                           int32_t *cg_error) {
+    PrivateAPI api = {0};
+    if (!load_private_api(&api)) {
+        return DTD_ERROR_PRIVATE_API_UNAVAILABLE;
+    }
+
+    if (enabled) {
+        CGDisplayConfigRef recommit = NULL;
+        CGError recommit_error = CGBeginDisplayConfiguration(&recommit);
+        if (recommit_error == kCGErrorSuccess && recommit != NULL) {
+            (void)CGCompleteDisplayConfiguration(
+                recommit, kCGConfigureForSession);
+        }
+    }
+
+    CGDisplayConfigRef config = NULL;
+    CGError error = CGBeginDisplayConfiguration(&config);
+    if (error != kCGErrorSuccess || config == NULL) {
+        *cg_error = error;
+        return DTD_ERROR_CONFIGURATION;
+    }
+
+    error = api.configure_enabled(config, display_id, enabled);
+    if (error != kCGErrorSuccess) {
+        CGCancelDisplayConfiguration(config);
+        *cg_error = error;
+        return DTD_ERROR_CONFIGURATION;
+    }
+
+    error = CGCompleteDisplayConfiguration(config, kCGConfigureForAppOnly);
+    if (error != kCGErrorSuccess) {
+        *cg_error = error;
+        return DTD_ERROR_CONFIGURATION;
+    }
+
+    *cg_error = kCGErrorSuccess;
     return DTD_SUCCESS;
 }
 
@@ -185,6 +257,32 @@ DTDResult dtd_get_display_state(DTDDisplayState *state) {
     }
 
     return copy_state(&api, state);
+}
+
+DTDResult dtd_get_active_external_display_count(uint32_t *count) {
+    if (count == NULL) {
+        return DTD_ERROR_DISPLAY_ENUMERATION;
+    }
+
+    *count = 0;
+#if !defined(__arm64__)
+    return DTD_ERROR_UNSUPPORTED_ARCHITECTURE;
+#endif
+
+    DisplayList active = {0};
+    CGError error = copy_display_list(CGGetActiveDisplayList, &active);
+    if (error != kCGErrorSuccess) {
+        return DTD_ERROR_DISPLAY_ENUMERATION;
+    }
+
+    for (uint32_t i = 0; i < active.count; ++i) {
+        if (dtd_is_hardware_external_display(active.ids[i])) {
+            ++*count;
+        }
+    }
+
+    free_display_list(&active);
+    return DTD_SUCCESS;
 }
 
 DTDResult dtd_set_builtin_display_enabled(bool enabled,
@@ -212,46 +310,84 @@ DTDResult dtd_set_builtin_display_enabled(bool enabled,
         return DTD_ERROR_NO_ACTIVE_EXTERNAL_DISPLAY;
     }
 
-    PrivateAPI api = {0};
-    if (!load_private_api(&api)) {
-        return DTD_ERROR_PRIVATE_API_UNAVAILABLE;
+    if (enabled) {
+        return dtd_restore_builtin_display(
+            current.builtin_display_id, resulting_state);
     }
 
-    CGDisplayConfigRef config = NULL;
-    CGError error = CGBeginDisplayConfiguration(&config);
-    if (error != kCGErrorSuccess || config == NULL) {
+    result = configure_display_enabled(current.builtin_display_id, enabled,
+                                       &current.cg_error);
+    if (result != DTD_SUCCESS) {
         if (resulting_state != NULL) {
             *resulting_state = current;
-            resulting_state->cg_error = error;
         }
-        return DTD_ERROR_CONFIGURATION;
-    }
-
-    error = api.configure_enabled(config, current.builtin_display_id, enabled);
-    if (error != kCGErrorSuccess) {
-        CGCancelDisplayConfiguration(config);
-        if (resulting_state != NULL) {
-            *resulting_state = current;
-            resulting_state->cg_error = error;
-        }
-        return DTD_ERROR_CONFIGURATION;
-    }
-
-    error = CGCompleteDisplayConfiguration(config, kCGConfigureForSession);
-    if (error != kCGErrorSuccess) {
-        if (resulting_state != NULL) {
-            *resulting_state = current;
-            resulting_state->cg_error = error;
-        }
-        return DTD_ERROR_CONFIGURATION;
+        return result;
     }
 
     current.builtin_display_active = enabled;
-    current.cg_error = kCGErrorSuccess;
     if (resulting_state != NULL) {
         *resulting_state = current;
     }
     return DTD_SUCCESS;
+}
+
+DTDResult dtd_restore_builtin_display(uint32_t builtin_display_id,
+                                      DTDDisplayState *resulting_state) {
+    DTDDisplayState recovered = {
+        .builtin_display_id = builtin_display_id,
+        .builtin_display_active = false,
+        .active_external_display_count = 0,
+        .cg_error = kCGErrorSuccess,
+    };
+
+    PrivateAPI api = {0};
+    if (!load_private_api(&api)) {
+        if (resulting_state != NULL) {
+            *resulting_state = recovered;
+        }
+        return DTD_ERROR_PRIVATE_API_UNAVAILABLE;
+    }
+
+    CGDirectDisplayID current_builtin_id = kCGNullDirectDisplay;
+    int32_t discovery_error = kCGErrorSuccess;
+    DTDResult discovery_result = find_builtin_display(
+        &api, &current_builtin_id, &discovery_error);
+    if (discovery_result == DTD_SUCCESS) {
+        builtin_display_id = current_builtin_id;
+        recovered.builtin_display_id = current_builtin_id;
+    }
+
+    if (builtin_display_id == kCGNullDirectDisplay) {
+        recovered.cg_error = discovery_error;
+        if (resulting_state != NULL) {
+            *resulting_state = recovered;
+        }
+        return DTD_ERROR_BUILTIN_DISPLAY_NOT_FOUND;
+    }
+
+    uint32_t external_count = 0;
+    if (dtd_get_active_external_display_count(&external_count) ==
+        DTD_SUCCESS) {
+        recovered.active_external_display_count = external_count;
+    }
+
+    DTDResult result = configure_display_enabled(
+        builtin_display_id, true, &recovered.cg_error);
+    bool is_online = CGDisplayIsOnline(builtin_display_id);
+    bool is_active = CGDisplayIsActive(builtin_display_id);
+    if (is_online || is_active) {
+        result = DTD_SUCCESS;
+        recovered.builtin_display_active = true;
+        recovered.cg_error = kCGErrorSuccess;
+    } else if (result == DTD_SUCCESS) {
+        result = DTD_ERROR_CONFIGURATION;
+        recovered.cg_error = kCGErrorCannotComplete;
+    }
+
+    if (resulting_state != NULL) {
+        *resulting_state = recovered;
+    }
+    return result;
 }
 
 DTDResult dtd_toggle_builtin_display(DTDDisplayState *resulting_state) {

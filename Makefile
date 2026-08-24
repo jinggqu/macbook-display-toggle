@@ -2,14 +2,14 @@ CC := xcrun clang
 SWIFTC := xcrun swiftc
 ARCH ?= arm64
 MACOSX_DEPLOYMENT_TARGET ?= 13.0
-VERSION ?= 0.2.1
+VERSION ?= 0.3
 CFLAGS := -std=c11 -O2 -Wall -Wextra -Werror -arch $(ARCH) \
 	-mmacosx-version-min=$(MACOSX_DEPLOYMENT_TARGET)
 SWIFTFLAGS := -O -warnings-as-errors -swift-version 5 \
 	-target $(ARCH)-apple-macosx$(MACOSX_DEPLOYMENT_TARGET) \
 	-module-cache-path build/module-cache
-CORE_GRAPHICS := -framework CoreGraphics
-APP_FRAMEWORKS := -framework AppKit -framework CoreGraphics
+CORE_GRAPHICS := -framework CoreGraphics -framework IOKit
+APP_FRAMEWORKS := -framework AppKit -framework CoreGraphics -framework IOKit
 
 CLI := build/display-toggle
 ALIASES := build/don build/doff
@@ -18,7 +18,7 @@ APP := build/$(APP_NAME)
 APP_EXECUTABLE := $(APP)/Contents/MacOS/MacBookDisplayToggle
 APP_INFO := $(APP)/Contents/Info.plist
 CORE_OBJECT := build/display-control.o
-MENU_POLICY_TEST := build/menu-policy-tests
+POLICY_TEST := build/policy-tests
 DMG_ROOT := build/dmg-root
 DMG_APP_NAME := MacBook Display Toggle.app
 RELEASE_DMG := build/MacBook-Display-Toggle-v$(VERSION)-macOS-$(ARCH).dmg
@@ -45,22 +45,26 @@ $(CORE_OBJECT): display-control.c display-control.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) -c display-control.c -o $@
 
-$(APP_EXECUTABLE): app/main.swift app/MenuPolicy.swift app/Info.plist \
+$(APP_EXECUTABLE): app/main.swift app/MenuPolicy.swift \
+		app/SafetyRecoveryPolicy.swift app/Info.plist \
 		display-control.h $(CORE_OBJECT)
 	@mkdir -p "$(APP)/Contents/MacOS"
 	cp app/Info.plist "$(APP_INFO)"
-	$(SWIFTC) $(SWIFTFLAGS) app/main.swift app/MenuPolicy.swift $(CORE_OBJECT) \
+	$(SWIFTC) $(SWIFTFLAGS) app/main.swift app/MenuPolicy.swift \
+		app/SafetyRecoveryPolicy.swift $(CORE_OBJECT) \
 		-import-objc-header display-control.h $(APP_FRAMEWORKS) \
 		-o "$(APP_EXECUTABLE)"
 	codesign --force --deep --sign - "$(APP)"
 
-$(MENU_POLICY_TEST): app/MenuPolicy.swift tests/MenuPolicyTests.swift
+$(POLICY_TEST): app/MenuPolicy.swift app/SafetyRecoveryPolicy.swift \
+		tests/MenuPolicyTests.swift
 	@mkdir -p build
 	$(SWIFTC) $(SWIFTFLAGS) -parse-as-library \
-		app/MenuPolicy.swift tests/MenuPolicyTests.swift -o $@
+		app/MenuPolicy.swift app/SafetyRecoveryPolicy.swift \
+		tests/MenuPolicyTests.swift -o $@
 
-test: $(MENU_POLICY_TEST)
-	$(MENU_POLICY_TEST)
+test: $(POLICY_TEST)
+	$(POLICY_TEST)
 
 install: cli
 	install -d $(BINDIR)

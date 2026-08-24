@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import OSLog
 
 private func resultMessage(_ result: DTDResult) -> String {
     String(cString: dtd_result_message(result))
@@ -10,7 +11,6 @@ private func displayReconfigurationCallback(
     _ flags: CGDisplayChangeSummaryFlags,
     _ userInfo: UnsafeMutableRawPointer?
 ) {
-    _ = display
     guard !flags.contains(.beginConfigurationFlag), let userInfo else {
         return
     }
@@ -20,9 +20,12 @@ private func displayReconfigurationCallback(
         .takeUnretainedValue()
 
     // Core Graphics advises against changing display configuration inside
-    // the callback. Let WindowServer settle, then recover on the main queue.
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-        delegate.displayConfigurationDidChange()
+    // the callback. Leave it first, then recover on the main queue.
+    DispatchQueue.main.async {
+        delegate.displayConfigurationDidChange(
+            display: display,
+            flags: flags
+        )
     }
 }
 
@@ -31,14 +34,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         withLength: NSStatusItem.squareLength
     )
     private let contextMenu = NSMenu()
+    private let logger = Logger(
+        subsystem: "io.github.jinggqu.macbook-display-toggle",
+        category: "display"
+    )
     private var lastState = DTDDisplayState()
     private var lastResult = DTD_SUCCESS
     private var isRecovering = false
+    private var knownBuiltInDisplayID: CGDirectDisplayID =
+        kCGNullDirectDisplay
+    private var safetyRecoveryArmed = false
+    private var safetyWatchdogTimer: Timer?
+    private var activeExternalDisplayIDs = Set<CGDirectDisplayID>()
+    private var externalDisplayTrackingInitialized = false
+    private var recoverySequence = 0
+    private var recoveryWorkItem: DispatchWorkItem?
+    private let recoveryRetryDelays: [TimeInterval] = [
+        0.0, 0.2, 0.5, 1.0, 2.0,
+    ]
+    private var prefersBuiltInDisplayOff = false
+    private var preferredStateSequence = 0
+    private var preferredStateWorkItem: DispatchWorkItem?
+    private let preferredStateRetryDelays: [TimeInterval] = [
+        0.75, 1.5, 3.0,
+    ]
+    private let defaults = UserDefaults.standard
+    private let builtInDisplayIDKey = "LastKnownBuiltInDisplayID"
+    private let recoveryArmedKey = "SafetyRecoveryArmed"
+    private let preferredOffKey = "PrefersBuiltInDisplayOff"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         _ = notification
         NSApp.setActivationPolicy(.accessory)
 
+        let savedDisplayID = defaults.integer(forKey: builtInDisplayIDKey)
+        if savedDisplayID > 0 {
+            knownBuiltInDisplayID = CGDirectDisplayID(savedDisplayID)
+        }
+        safetyRecoveryArmed = defaults.bool(forKey: recoveryArmedKey)
+        prefersBuiltInDisplayOff = defaults.bool(forKey: preferredOffKey)
+        updateSafetyWatchdog()
         contextMenu.autoenablesItems = false
         contextMenu.delegate = self
         statusItem.menu = contextMenu
@@ -63,12 +98,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             object: nil
         )
 
+        synchronizeActiveExternalDisplays()
         refreshState(allowSafetyRecovery: true)
+        schedulePreferredStateReapply()
         rebuildContextMenu()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         _ = notification
+        safetyWatchdogTimer?.invalidate()
+        safetyWatchdogTimer = nil
+        cancelSafetyRecoveryAttempts()
+        cancelPreferredStateAttempts()
         restoreBuiltInDisplay()
         CGDisplayRemoveReconfigurationCallback(
             displayReconfigurationCallback,
@@ -97,11 +138,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ = notification
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             self?.refreshState(allowSafetyRecovery: true)
+            self?.schedulePreferredStateReapply()
         }
     }
 
-    func displayConfigurationDidChange() {
-        refreshState(allowSafetyRecovery: true)
+    func applicationDidChangeScreenParameters(_ notification: Notification) {
+        _ = notification
+        displayConfigurationDidChange(display: nil, flags: [])
+    }
+
+    func displayConfigurationDidChange(
+        display: CGDirectDisplayID?,
+        flags: CGDisplayChangeSummaryFlags
+    ) {
+        if let display {
+            updateTrackedExternalDisplays(display: display, flags: flags)
+        }
+        refreshState(allowSafetyRecovery: false)
+        scheduleSafetyRecoveryAttempts()
+        schedulePreferredStateReapply()
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -113,8 +168,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func setBuiltInDisplay(enabled: Bool) {
+        cancelPreferredStateAttempts()
         var state = DTDDisplayState()
-        let result = dtd_set_builtin_display_enabled(enabled, &state)
+        var result = dtd_set_builtin_display_enabled(enabled, &state)
+        if result != DTD_SUCCESS && enabled &&
+            knownBuiltInDisplayID != kCGNullDirectDisplay {
+            result = dtd_restore_builtin_display(
+                knownBuiltInDisplayID,
+                &state
+            )
+        }
+        if result == DTD_SUCCESS {
+            updatePreferredState(prefersOff: !enabled)
+            rememberDisplayState(state)
+            synchronizeActiveExternalDisplays()
+        }
+        if result != DTD_SUCCESS {
+            logger.error(
+                "Manual display change failed enabled=\(enabled, privacy: .public) result=\(result.rawValue, privacy: .public) cgError=\(state.cg_error, privacy: .public)"
+            )
+        }
         handle(result: result, state: state)
     }
 
@@ -150,21 +223,345 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lastResult = result
         lastState = state
 
-        if allowSafetyRecovery && result == DTD_SUCCESS &&
-            !state.builtin_display_active &&
-            state.active_external_display_count == 0 && !isRecovering {
-            isRecovering = true
-            var recoveredState = DTDDisplayState()
-            let recoveryResult = dtd_set_builtin_display_enabled(
-                true,
-                &recoveredState
-            )
-            isRecovering = false
-            lastResult = recoveryResult
-            lastState = recoveredState
+        if result == DTD_SUCCESS {
+            rememberDisplayState(state)
         }
 
         updateStatusItem()
+
+        if allowSafetyRecovery {
+            scheduleSafetyRecoveryAttempts()
+        }
+    }
+
+    private func rememberDisplayState(_ state: DTDDisplayState) {
+        if state.builtin_display_id != kCGNullDirectDisplay {
+            knownBuiltInDisplayID = state.builtin_display_id
+            defaults.set(
+                Int(state.builtin_display_id),
+                forKey: builtInDisplayIDKey
+            )
+        }
+        safetyRecoveryArmed = !state.builtin_display_active
+        defaults.set(safetyRecoveryArmed, forKey: recoveryArmedKey)
+        updateSafetyWatchdog()
+        if !safetyRecoveryArmed {
+            cancelSafetyRecoveryAttempts()
+        }
+    }
+
+    private func updateSafetyWatchdog() {
+        if safetyRecoveryArmed {
+            guard safetyWatchdogTimer == nil else {
+                return
+            }
+            safetyWatchdogTimer = Timer.scheduledTimer(
+                withTimeInterval: 3.0,
+                repeats: true
+            ) { [weak self] _ in
+                self?.safetyWatchdogDidFire()
+            }
+            safetyWatchdogTimer?.tolerance = 0.75
+        } else {
+            safetyWatchdogTimer?.invalidate()
+            safetyWatchdogTimer = nil
+        }
+    }
+
+    private func safetyWatchdogDidFire() {
+        guard recoveryWorkItem == nil, safetyRecoveryArmed else {
+            return
+        }
+
+        var externalCount: UInt32 = 0
+        let countResult = dtd_get_active_external_display_count(
+            &externalCount
+        )
+        let trackedNoExternal = externalDisplayTrackingInitialized &&
+            activeExternalDisplayIDs.isEmpty
+        let liveNoExternal = countResult == DTD_SUCCESS && externalCount == 0
+        guard trackedNoExternal || liveNoExternal else {
+            return
+        }
+
+        logger.notice(
+            "Safety watchdog detected no hardware external display"
+        )
+        scheduleSafetyRecoveryAttempts()
+    }
+
+    private func synchronizeActiveExternalDisplays() {
+        var count: UInt32 = 0
+        guard CGGetActiveDisplayList(0, nil, &count) == .success else {
+            return
+        }
+
+        if count == 0 {
+            activeExternalDisplayIDs.removeAll()
+            externalDisplayTrackingInitialized = true
+            return
+        }
+
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        var actualCount = count
+        let result = ids.withUnsafeMutableBufferPointer { buffer in
+            CGGetActiveDisplayList(count, buffer.baseAddress, &actualCount)
+        }
+        guard result == .success else {
+            return
+        }
+
+        activeExternalDisplayIDs = Set(
+            ids.prefix(Int(actualCount)).filter {
+                dtd_is_hardware_external_display($0)
+            }
+        )
+        externalDisplayTrackingInitialized = true
+    }
+
+    private func updateTrackedExternalDisplays(
+        display: CGDirectDisplayID,
+        flags: CGDisplayChangeSummaryFlags
+    ) {
+        if flags.contains(.removeFlag) || flags.contains(.disabledFlag) {
+            activeExternalDisplayIDs.remove(display)
+            externalDisplayTrackingInitialized = true
+        } else if flags.contains(.addFlag) ||
+            flags.contains(.enabledFlag) {
+            if dtd_is_hardware_external_display(display) {
+                activeExternalDisplayIDs.insert(display)
+            } else {
+                activeExternalDisplayIDs.remove(display)
+            }
+            externalDisplayTrackingInitialized = true
+        }
+    }
+
+    private func scheduleSafetyRecoveryAttempts() {
+        guard safetyRecoveryArmed,
+              knownBuiltInDisplayID != kCGNullDirectDisplay else {
+            return
+        }
+
+        recoverySequence += 1
+        scheduleSafetyRecoveryAttempt(index: 0, sequence: recoverySequence)
+    }
+
+    private func scheduleSafetyRecoveryAttempt(
+        index: Int,
+        sequence: Int
+    ) {
+        guard index < recoveryRetryDelays.count,
+              sequence == recoverySequence else {
+            return
+        }
+
+        recoveryWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.runSafetyRecoveryAttempt(index: index, sequence: sequence)
+        }
+        recoveryWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + recoveryRetryDelays[index],
+            execute: workItem
+        )
+    }
+
+    private func runSafetyRecoveryAttempt(index: Int, sequence: Int) {
+        guard sequence == recoverySequence, !isRecovering else {
+            return
+        }
+        recoveryWorkItem = nil
+
+        var externalCount: UInt32 = 0
+        let countResult = dtd_get_active_external_display_count(
+            &externalCount
+        )
+        let trackedNoExternal = externalDisplayTrackingInitialized &&
+            activeExternalDisplayIDs.isEmpty
+        let liveNoExternal = countResult == DTD_SUCCESS && externalCount == 0
+        let action = SafetyRecoveryPolicy.action(
+            recoveryArmed: safetyRecoveryArmed,
+            noExternalDisplayConfirmed: trackedNoExternal || liveNoExternal
+        )
+        if action == .stop {
+            return
+        }
+        if action == .retry {
+            scheduleSafetyRecoveryAttempt(
+                index: index + 1,
+                sequence: sequence
+            )
+            return
+        }
+
+        isRecovering = true
+        var recoveredState = DTDDisplayState()
+        let recoveryResult = dtd_restore_builtin_display(
+            knownBuiltInDisplayID,
+            &recoveredState
+        )
+        isRecovering = false
+
+        if recoveryResult == DTD_SUCCESS {
+            logger.notice(
+                "Built-in display restored automatically displayID=\(recoveredState.builtin_display_id, privacy: .public)"
+            )
+        } else {
+            logger.error(
+                "Automatic restore failed attempt=\(index + 1, privacy: .public) result=\(recoveryResult.rawValue, privacy: .public) cgError=\(recoveredState.cg_error, privacy: .public)"
+            )
+        }
+
+        lastResult = recoveryResult
+        lastState = recoveredState
+        if recoveryResult == DTD_SUCCESS {
+            rememberDisplayState(recoveredState)
+            synchronizeActiveExternalDisplays()
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + 0.5
+            ) { [weak self] in
+                self?.refreshState(allowSafetyRecovery: false)
+            }
+        } else {
+            if index + 1 < recoveryRetryDelays.count {
+                scheduleSafetyRecoveryAttempt(
+                    index: index + 1,
+                    sequence: sequence
+                )
+            } else {
+                logger.error(
+                    "Direct recovery exhausted; restoring permanent display configuration"
+                )
+                CGRestorePermanentDisplayConfiguration()
+                DispatchQueue.main.asyncAfter(
+                    deadline: .now() + 1.0
+                ) { [weak self] in
+                    self?.refreshState(allowSafetyRecovery: true)
+                }
+            }
+        }
+        updateStatusItem()
+    }
+
+    private func cancelSafetyRecoveryAttempts() {
+        recoverySequence += 1
+        recoveryWorkItem?.cancel()
+        recoveryWorkItem = nil
+    }
+
+    private func updatePreferredState(prefersOff: Bool) {
+        prefersBuiltInDisplayOff = prefersOff
+        defaults.set(prefersOff, forKey: preferredOffKey)
+        if !prefersOff {
+            cancelPreferredStateAttempts()
+        }
+    }
+
+    private func schedulePreferredStateReapply() {
+        guard prefersBuiltInDisplayOff else {
+            cancelPreferredStateAttempts()
+            return
+        }
+
+        preferredStateSequence += 1
+        schedulePreferredStateAttempt(
+            index: 0,
+            sequence: preferredStateSequence
+        )
+    }
+
+    private func schedulePreferredStateAttempt(
+        index: Int,
+        sequence: Int
+    ) {
+        guard index < preferredStateRetryDelays.count,
+              sequence == preferredStateSequence else {
+            return
+        }
+
+        preferredStateWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.runPreferredStateAttempt(index: index, sequence: sequence)
+        }
+        preferredStateWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + preferredStateRetryDelays[index],
+            execute: workItem
+        )
+    }
+
+    private func runPreferredStateAttempt(index: Int, sequence: Int) {
+        guard sequence == preferredStateSequence,
+              prefersBuiltInDisplayOff else {
+            return
+        }
+        preferredStateWorkItem = nil
+
+        if isRecovering {
+            schedulePreferredStateAttempt(
+                index: index + 1,
+                sequence: sequence
+            )
+            return
+        }
+
+        var state = DTDDisplayState()
+        let stateResult = dtd_get_display_state(&state)
+        let action = PreferredDisplayPolicy.action(
+            prefersBuiltInDisplayOff: prefersBuiltInDisplayOff,
+            statusAvailable: stateResult == DTD_SUCCESS,
+            builtInDisplayActive: state.builtin_display_active,
+            activeExternalDisplayCount: state.active_external_display_count
+        )
+
+        if action == .stop {
+            return
+        }
+        if action == .retry {
+            schedulePreferredStateAttempt(
+                index: index + 1,
+                sequence: sequence
+            )
+            return
+        }
+
+        isRecovering = true
+        var resultingState = DTDDisplayState()
+        let result = dtd_set_builtin_display_enabled(
+            false,
+            &resultingState
+        )
+        isRecovering = false
+
+        if result == DTD_SUCCESS {
+            logger.notice(
+                "Remembered Off state restored after external display connected"
+            )
+        } else {
+            logger.error(
+                "Remembered Off state restore failed attempt=\(index + 1, privacy: .public) result=\(result.rawValue, privacy: .public) cgError=\(resultingState.cg_error, privacy: .public)"
+            )
+        }
+
+        lastResult = result
+        lastState = resultingState
+        if result == DTD_SUCCESS {
+            rememberDisplayState(resultingState)
+            synchronizeActiveExternalDisplays()
+        } else {
+            schedulePreferredStateAttempt(
+                index: index + 1,
+                sequence: sequence
+            )
+        }
+        updateStatusItem()
+    }
+
+    private func cancelPreferredStateAttempts() {
+        preferredStateSequence += 1
+        preferredStateWorkItem?.cancel()
+        preferredStateWorkItem = nil
     }
 
     private func updateStatusItem() {
@@ -184,7 +581,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let preferredSymbol = isOn ? "laptopcomputer" : "laptopcomputer.slash"
         button.image = symbol(named: preferredSymbol) ??
             symbol(named: "laptopcomputer")
-        button.alphaValue = isOn ? 1.0 : 0.55
+        button.alphaValue = 1.0
 
         let stateText = isOn ? "On" : "Off"
         button.toolTip = "Built-in display: \(stateText)"
@@ -217,6 +614,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             addInformationalItem("Status unavailable")
         }
+        addInformationalItem("Version \(applicationVersion)")
 
         contextMenu.addItem(.separator())
         let availability = MenuPolicy.availability(
@@ -277,11 +675,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func restoreBuiltInDisplay() {
         var state = DTDDisplayState()
-        guard dtd_get_display_state(&state) == DTD_SUCCESS,
-              !state.builtin_display_active else {
+        let result = dtd_get_display_state(&state)
+        if result == DTD_SUCCESS && state.builtin_display_active {
+            rememberDisplayState(state)
             return
         }
-        _ = dtd_set_builtin_display_enabled(true, &state)
+
+        if result == DTD_SUCCESS {
+            if dtd_set_builtin_display_enabled(true, &state) == DTD_SUCCESS {
+                rememberDisplayState(state)
+            }
+        } else if knownBuiltInDisplayID != kCGNullDirectDisplay {
+            if dtd_restore_builtin_display(
+                knownBuiltInDisplayID,
+                &state
+            ) == DTD_SUCCESS {
+                rememberDisplayState(state)
+            } else {
+                CGRestorePermanentDisplayConfiguration()
+            }
+        }
+    }
+
+    private var applicationVersion: String {
+        Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleShortVersionString"
+        ) as? String ?? "Unknown"
     }
 
     private func showError(title: String, message: String) {
