@@ -28,8 +28,8 @@ make
 open build/MacBookDisplayToggle.app
 ```
 
-- Left-click the menu bar icon to toggle the built-in display.
-- Right-click it to view status, turn the display on or off explicitly, or quit.
+- Click the menu bar icon to open the status and controls menu.
+- Choose **Turn Built-in Display On** or **Turn Built-in Display Off**. An action is disabled when the display is already in that state; **Off** is also disabled when no active external display exists.
 - Quitting restores the built-in display.
 - If the external display is disconnected while the built-in display is off, the running app automatically restores the built-in display.
 
@@ -39,12 +39,12 @@ The app has no Dock icon and uses an ad-hoc local signature for testing. `make` 
 make release
 ```
 
-The resulting files are `build/MacBook-Display-Toggle-v0.2.0-macOS-arm64.dmg` and its `.sha256` checksum. The DMG is only a transport and installation container for the directory-based `.app`. A future production release should be signed with a Developer ID and notarized to avoid Gatekeeper warnings.
+The resulting files are `build/MacBook-Display-Toggle-v0.2.1-macOS-arm64.dmg` and its `.sha256` checksum. The DMG is only a transport and installation container for the directory-based `.app`. A future production release should be signed with a Developer ID and notarized to avoid Gatekeeper warnings.
 
 After downloading both Release assets into the same directory, verify the DMG with:
 
 ```sh
-shasum -a 256 -c MacBook-Display-Toggle-v0.2.0-macOS-arm64.dmg.sha256
+shasum -a 256 -c MacBook-Display-Toggle-v0.2.1-macOS-arm64.dmg.sha256
 ```
 
 ## Command-line tool
@@ -76,7 +76,7 @@ don
 
 ## Safety
 
-Before every off operation, including an app click and `doff`, the shared control core verifies that at least one non-built-in display is active. It refuses to disable the built-in display if that check fails. While the app is running, it also restores the built-in display if the last external display is disconnected.
+Before every off operation, including the app's **Off** action and `doff`, the shared control core verifies that at least one non-built-in display is active. It refuses to disable the built-in display if that check fails. The menu also disables actions that are redundant or unsafe. While the app is running, it restores the built-in display if the last external display is disconnected.
 
 The change lasts only for the current login session, so logging out or rebooting provides a recovery path. If an `on` operation fails, close and reopen the lid, reconnect the external display, log out, or reboot. Disabling a display may cause macOS to rearrange its windows; this tool does not preserve window positions.
 
@@ -116,8 +116,8 @@ make
 open build/MacBookDisplayToggle.app
 ```
 
-- 左键单击状态栏图标直接切换内建屏幕。
-- 右键单击可以查看状态、明确选择开启或关闭，以及退出应用。
+- 单击状态栏图标打开状态和控制菜单。
+- 选择“开启内建屏幕”或“关闭内建屏幕”。如果内建屏幕已经处于目标状态，对应操作会被禁用；没有活动外接显示器时，“关闭”也会被禁用。
 - 退出应用时会恢复内建屏幕。
 - 内建屏幕关闭期间，如果最后一台外接显示器被拔掉，运行中的应用会自动恢复内建屏幕。
 
@@ -127,12 +127,12 @@ open build/MacBookDisplayToggle.app
 make release
 ```
 
-输出文件为 `build/MacBook-Display-Toggle-v0.2.0-macOS-arm64.dmg` 及对应的 `.sha256` 校验文件。DMG 只是目录型 `.app` 的传输和安装容器；未来正式版应使用 Developer ID 签名并完成 Apple 公证，以免出现 Gatekeeper 警告。
+输出文件为 `build/MacBook-Display-Toggle-v0.2.1-macOS-arm64.dmg` 及对应的 `.sha256` 校验文件。DMG 只是目录型 `.app` 的传输和安装容器；未来正式版应使用 Developer ID 签名并完成 Apple 公证，以免出现 Gatekeeper 警告。
 
 将两个 Release 附件下载到同一目录后，可以验证 DMG：
 
 ```sh
-shasum -a 256 -c MacBook-Display-Toggle-v0.2.0-macOS-arm64.dmg.sha256
+shasum -a 256 -c MacBook-Display-Toggle-v0.2.1-macOS-arm64.dmg.sha256
 ```
 
 ## 命令行工具
@@ -164,7 +164,7 @@ don
 
 ## 安全保护
 
-每次执行关闭操作时，包括单击应用图标或通过 `doff` 调用，共享控制核心都会确认至少存在一台处于活动状态的非内建显示器。如果检测失败，工具会拒绝关闭内建屏幕。应用运行期间，如果最后一台外接显示器被拔掉，还会自动恢复内建屏幕。
+每次执行关闭操作时，包括选择应用中的“关闭”或通过 `doff` 调用，共享控制核心都会确认至少存在一台处于活动状态的非内建显示器。如果检测失败，工具会拒绝关闭内建屏幕。菜单还会禁用重复或不安全的操作。应用运行期间，如果最后一台外接显示器被拔掉，还会自动恢复内建屏幕。
 
 显示配置仅对当前登录会话有效，因此注销或重启可以作为恢复手段。如果执行 `on` 失败，请依次尝试合上再打开上盖、重新插拔外接显示器、注销或重启。关闭显示器可能导致 macOS 重新排列窗口；本工具不保存窗口位置。
 

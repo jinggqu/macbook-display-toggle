@@ -26,7 +26,7 @@ private func displayReconfigurationCallback(
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(
         withLength: NSStatusItem.squareLength
     )
@@ -39,11 +39,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         _ = notification
         NSApp.setActivationPolicy(.accessory)
 
-        if let button = statusItem.button {
-            button.target = self
-            button.action = #selector(statusItemClicked(_:))
-            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
-        }
+        contextMenu.autoenablesItems = false
+        contextMenu.delegate = self
+        statusItem.menu = contextMenu
 
         let callbackResult = CGDisplayRegisterReconfigurationCallback(
             displayReconfigurationCallback,
@@ -66,6 +64,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         refreshState(allowSafetyRecovery: true)
+        rebuildContextMenu()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -76,15 +75,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Unmanaged.passUnretained(self).toOpaque()
         )
         NSWorkspace.shared.notificationCenter.removeObserver(self)
-    }
-
-    @objc private func statusItemClicked(_ sender: Any?) {
-        _ = sender
-        if NSApp.currentEvent?.type == .rightMouseUp {
-            showContextMenu()
-        } else {
-            toggleBuiltInDisplay()
-        }
     }
 
     @objc private func turnOn(_ sender: Any?) {
@@ -114,15 +104,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshState(allowSafetyRecovery: true)
     }
 
-    private func toggleBuiltInDisplay() {
-        var state = DTDDisplayState()
-        let stateResult = dtd_get_display_state(&state)
-        guard stateResult == DTD_SUCCESS else {
-            handle(result: stateResult, state: state)
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === contextMenu else {
             return
         }
-
-        setBuiltInDisplay(enabled: !state.builtin_display_active)
+        refreshState(allowSafetyRecovery: true)
+        rebuildContextMenu()
     }
 
     private func setBuiltInDisplay(enabled: Bool) {
@@ -217,8 +204,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return image
     }
 
-    private func showContextMenu() {
-        refreshState(allowSafetyRecovery: true)
+    private func rebuildContextMenu() {
         contextMenu.removeAllItems()
 
         if lastResult == DTD_SUCCESS {
@@ -233,12 +219,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         contextMenu.addItem(.separator())
+        let availability = MenuPolicy.availability(
+            statusAvailable: lastResult == DTD_SUCCESS,
+            builtInDisplayActive: lastState.builtin_display_active,
+            activeExternalDisplayCount:
+                lastState.active_external_display_count
+        )
+
         let onItem = contextMenu.addItem(
             withTitle: "Turn Built-in Display On",
             action: #selector(turnOn(_:)),
             keyEquivalent: ""
         )
         onItem.target = self
+        onItem.isEnabled = availability.canTurnOn
+        if !onItem.isEnabled {
+            onItem.toolTip = lastResult == DTD_SUCCESS
+                ? "The built-in display is already on."
+                : "Display status is unavailable."
+        }
 
         let offItem = contextMenu.addItem(
             withTitle: "Turn Built-in Display Off",
@@ -246,9 +245,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: ""
         )
         offItem.target = self
-        offItem.isEnabled = lastResult == DTD_SUCCESS &&
-            lastState.builtin_display_active &&
-            lastState.active_external_display_count > 0
+        offItem.isEnabled = availability.canTurnOff
+        if !offItem.isEnabled {
+            if lastResult != DTD_SUCCESS {
+                offItem.toolTip = "Display status is unavailable."
+            } else if !lastState.builtin_display_active {
+                offItem.toolTip = "The built-in display is already off."
+            } else {
+                offItem.toolTip =
+                    "Connect and activate an external display first."
+            }
+        }
 
         contextMenu.addItem(.separator())
         let quitItem = contextMenu.addItem(
@@ -257,14 +264,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: "q"
         )
         quitItem.target = self
-
-        if let button = statusItem.button {
-            contextMenu.popUp(
-                positioning: nil,
-                at: NSPoint(x: 0, y: button.bounds.minY),
-                in: button
-            )
-        }
     }
 
     private func addInformationalItem(_ title: String) {
