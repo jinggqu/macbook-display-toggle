@@ -2,7 +2,13 @@
 
 English | [简体中文](#简体中文)
 
-A tiny native command-line tool that manually enables or disables a MacBook's built-in display while an external display remains active.
+A tiny native menu bar app and command-line tool that manually enable or disable a MacBook's built-in display while an external display remains active.
+
+## Download
+
+Download the latest `MacBook-Display-Toggle-*.dmg` from [GitHub Releases](https://github.com/jinggqu/macbook-display-toggle/releases/latest), open it, and drag **MacBook Display Toggle** to the **Applications** shortcut.
+
+The current test release is ad-hoc signed because it does not yet have a Developer ID certificate or Apple notarization. On first launch, Control-click the app, choose **Open**, and confirm; alternatively use **System Settings → Privacy & Security → Open Anyway** after macOS blocks the first attempt.
 
 ## Requirements
 
@@ -11,7 +17,31 @@ A tiny native command-line tool that manually enables or disables a MacBook's bu
 - Xcode Command Line Tools
 - At least one active external display when turning the built-in display off
 
-## Build and use
+Build artifacts target arm64 and macOS 13.0 or later. Compilation, bundle validation, and private-symbol discovery have been checked on an M1 Mac running macOS 15.8; runtime behavior on other Apple Silicon models and macOS versions still requires device testing.
+
+## Menu bar app
+
+Build both the app and CLI, then open the app:
+
+```sh
+make
+open build/MacBookDisplayToggle.app
+```
+
+- Left-click the menu bar icon to toggle the built-in display.
+- Right-click it to view status, turn the display on or off explicitly, or quit.
+- Quitting restores the built-in display.
+- If the external display is disconnected while the built-in display is off, the running app automatically restores the built-in display.
+
+The app has no Dock icon and uses an ad-hoc local signature for testing. `make` directly creates `build/MacBookDisplayToggle.app`; no archive is needed for local use. Create a distributable DMG and checksum with:
+
+```sh
+make release
+```
+
+The resulting files are `build/MacBook-Display-Toggle-v0.2.0-macOS-arm64.dmg` and its `.sha256` checksum. The DMG is only a transport and installation container for the directory-based `.app`. A future production release should be signed with a Developer ID and notarized to avoid Gatekeeper warnings.
+
+## Command-line tool
 
 ```sh
 make
@@ -40,7 +70,7 @@ don
 
 ## Safety
 
-Before every off operation, including `doff`, the tool verifies that at least one non-built-in display is active. It refuses to disable the built-in display if that check fails, preventing a no-display state through normal use.
+Before every off operation, including an app click and `doff`, the shared control core verifies that at least one non-built-in display is active. It refuses to disable the built-in display if that check fails. While the app is running, it also restores the built-in display if the last external display is disconnected.
 
 The change lasts only for the current login session, so logging out or rebooting provides a recovery path. If an `on` operation fails, close and reopen the lid, reconnect the external display, log out, or reboot. Disabling a display may cause macOS to rearrange its windows; this tool does not preserve window positions.
 
@@ -54,7 +84,13 @@ These APIs are private and undocumented. A macOS update may change or remove the
 
 ## 简体中文
 
-一个极简的原生命令行工具：在外接显示器保持活动时，手动开启或关闭 MacBook 内建屏幕。
+一个极简的原生状态栏应用和命令行工具：在外接显示器保持活动时，手动开启或关闭 MacBook 内建屏幕。
+
+## 下载
+
+从 [GitHub Releases](https://github.com/jinggqu/macbook-display-toggle/releases/latest) 下载最新的 `MacBook-Display-Toggle-*.dmg`，打开后将 **MacBook Display Toggle** 拖到 **Applications** 快捷入口。
+
+当前测试版采用临时签名，尚未配置 Developer ID 和 Apple 公证。首次启动时，请按住 Control 单击应用、选择“打开”并确认；如果第一次已经被 macOS 拦截，也可以前往“系统设置 → 隐私与安全性 → 仍要打开”。
 
 ## 系统要求
 
@@ -63,7 +99,31 @@ These APIs are private and undocumented. A macOS update may change or remove the
 - Xcode Command Line Tools
 - 关闭内建屏幕时，至少有一台处于活动状态的外接显示器
 
-## 构建与使用
+构建产物面向 arm64，最低系统版本为 macOS 13.0。目前已在运行 macOS 15.8 的 M1 Mac 上验证编译、应用包结构和私有符号解析；其他 Apple Silicon 型号及 macOS 版本仍需实机测试。
+
+## 状态栏应用
+
+构建状态栏应用及 CLI，然后打开应用：
+
+```sh
+make
+open build/MacBookDisplayToggle.app
+```
+
+- 左键单击状态栏图标直接切换内建屏幕。
+- 右键单击可以查看状态、明确选择开启或关闭，以及退出应用。
+- 退出应用时会恢复内建屏幕。
+- 内建屏幕关闭期间，如果最后一台外接显示器被拔掉，运行中的应用会自动恢复内建屏幕。
+
+应用不显示 Dock 图标，测试构建使用本机临时签名。`make` 会直接生成 `build/MacBookDisplayToggle.app`，本机使用无需打包。可以生成便于分发的 DMG 及校验值：
+
+```sh
+make release
+```
+
+输出文件为 `build/MacBook-Display-Toggle-v0.2.0-macOS-arm64.dmg` 及对应的 `.sha256` 校验文件。DMG 只是目录型 `.app` 的传输和安装容器；未来正式版应使用 Developer ID 签名并完成 Apple 公证，以免出现 Gatekeeper 警告。
+
+## 命令行工具
 
 ```sh
 make
@@ -92,7 +152,7 @@ don
 
 ## 安全保护
 
-每次执行关闭操作时，包括通过 `doff` 调用，工具都会确认至少存在一台处于活动状态的非内建显示器。如果检测失败，工具会拒绝关闭内建屏幕，防止正常操作导致无屏幕可用。
+每次执行关闭操作时，包括单击应用图标或通过 `doff` 调用，共享控制核心都会确认至少存在一台处于活动状态的非内建显示器。如果检测失败，工具会拒绝关闭内建屏幕。应用运行期间，如果最后一台外接显示器被拔掉，还会自动恢复内建屏幕。
 
 显示配置仅对当前登录会话有效，因此注销或重启可以作为恢复手段。如果执行 `on` 失败，请依次尝试合上再打开上盖、重新插拔外接显示器、注销或重启。关闭显示器可能导致 macOS 重新排列窗口；本工具不保存窗口位置。
 
